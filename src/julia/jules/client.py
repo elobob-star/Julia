@@ -54,9 +54,30 @@ class HttpJulesClient:
         return dict(response.json())
 
     async def list_activities(self, session_id: str) -> list[dict[str, Any]]:
-        response = await self._http.get(f'/{session_id}/activities')
-        response.raise_for_status()
-        return list(response.json().get('activities', []))
+        """List activities for a session, tolerating transient 404s.
+
+        Live wire (verified 2026-06-16): a freshly-created session
+        briefly returns 404 from ``/sessions/{id}/activities`` while
+        Jules provisions state server-side. Treat that as "no
+        activities yet" rather than failing the task. A handful of
+        retries is enough; a sustained 404 would surface after that.
+        """
+        import asyncio as _asyncio
+
+        last_error: httpx.HTTPError | None = None
+        for attempt in range(4):
+            response = await self._http.get(f'/{session_id}/activities')
+            if response.status_code == 404 and attempt < 3:
+                await _asyncio.sleep(2 + attempt)
+                continue
+            if response.status_code == 404:
+                return []
+            response.raise_for_status()
+            return list(response.json().get('activities', []))
+        # Unreachable: the loop returns on success or after 404 retries.
+        if last_error is not None:
+            raise last_error
+        return []  # pragma: no cover
 
     async def approve_plan(self, session_id: str) -> None:
         response = await self._http.post(f'/{session_id}:approvePlan')

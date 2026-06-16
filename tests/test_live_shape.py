@@ -115,3 +115,47 @@ def test_activity_key_falls_back_when_no_id():
     key = dossier.activity_key(activity)
     assert key.startswith('completed:')
     assert 'pull/3' in key
+
+def test_list_activities_handles_transient_404():
+    """A freshly-created session may briefly 404; orchestrator retries.
+
+    Verified live 2026-06-16: the session we created returned 404
+    from /sessions/{id}/activities on the first poll, then 200 with
+    activity data after a couple of seconds. The HttpJulesClient
+    treats the initial 404 as "try again with backoff."
+    """
+    import asyncio
+    import httpx
+
+    from julia.jules.client import HttpJulesClient
+
+    call_count = 0
+
+    async def handler(request):
+        nonlocal call_count
+        call_count += 1
+        if call_count <= 2:
+            return httpx.Response(404, json={'error': 'session warmup'})
+        return httpx.Response(200, json={'activities': [{'id': 'a1'}]})
+
+    transport = httpx.MockTransport(handler)
+    client = HttpJulesClient(
+        api_key='AQ.test',
+        base_url='https://jules.googleapis.com/v1alpha',
+    )
+    client._http = httpx.AsyncClient(
+        base_url='https://jules.googleapis.com/v1alpha',
+        headers={'X-Goog-Api-Key': 'AQ.test'},
+        transport=transport,
+        timeout=30.0,
+    )
+    # Patch the small sleep to avoid real time waiting in the test.
+    real_sleep = asyncio.sleep
+    asyncio.sleep = lambda s: real_sleep(0)
+    try:
+        activities = asyncio.run(client.list_activities('sessions/x'))
+    finally:
+        asyncio.sleep = real_sleep
+        asyncio.run(client._http.aclose())
+    assert len(activities) == 1
+    assert call_count == 3  # two 404s, one 200
