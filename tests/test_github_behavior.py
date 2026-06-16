@@ -262,3 +262,48 @@ async def test_record_playbook_writes_directly_to_main():
         await editor.aclose()
     methods = [m for m, _ in calls]
     assert methods == ['GET', 'PUT']
+
+
+async def test_record_playbook_retries_after_409():
+    """A 409 on the first PUT means the SHA moved; one retry wins."""
+    get_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal get_count
+        if request.method == 'GET' and request.url.path.endswith(
+            '/contents/playbook/jules-playbook.md'
+        ):
+            get_count += 1
+            # Both reads return valid sha + raw; the first PUT fails
+            # with 409 to simulate a parallel commit landing between
+            # our refetch and our write.
+            return _json_response({
+                'sha': f'sha-{get_count}',
+                'content': _b64('# Playbook\n\n## Observed shape drift\n<!-- a -->\n'),
+            })
+        if request.method == 'PUT' and request.url.path.endswith(
+            '/contents/playbook/jules-playbook.md'
+        ):
+            payload = json.loads(request.content)
+            if payload['sha'] == 'sha-1':
+                return _json_response({'message': 'sha moved'}, status_code=409)
+            return _json_response({'commit': {'sha': 'commit-after-retry'}})
+        raise AssertionError(f'unexpected {request.method} {request.url.path}')
+
+    editor = GitHubBehaviorEditor(
+        token='ghp_dummy', owner='elobob-star', repo='behaviors'
+    )
+    editor._http = httpx.AsyncClient(
+        base_url='https://api.github.com',
+        headers={'Authorization': 'Bearer ghp_dummy',
+                 'Accept': 'application/vnd.github+json'},
+        transport=httpx.MockTransport(handler),
+        timeout=30.0,
+    )
+    try:
+        await editor.record_playbook_entry(
+            PlaybookEntry(kind='info', repo='a/b', task_id='t', gist='retried')
+        )
+    finally:
+        await editor.aclose()
+    assert get_count == 2, 'one extra GET on the 409 retry path'

@@ -277,20 +277,30 @@ class GitHubBehaviorEditor:
 
     async def record_playbook_entry(self, entry: PlaybookEntry) -> None:
         path = 'playbook/jules-playbook.md'
-        sha, raw = await self._get_file(path)
-        new_text = _append_to_playbook(raw, entry)
-        payload: dict[str, Any] = {
-            'message': f'playbook: {entry.kind} on {entry.repo} ({entry.task_id})',
-            'content': base64.b64encode(new_text.encode()).decode(),
-            'branch': self._base_branch,
-        }
-        if sha is not None:
-            payload['sha'] = sha
-        response = await self._http.put(
-            f'/repos/{self._owner}/{self._repo}/contents/{path}',
-            json=payload,
-        )
-        response.raise_for_status()
+        # 409 Conflict means the SHA moved between our GET and PUT
+        # (someone else -- including a parallel session -- pushed to
+        # ``main`` in the meantime). Retry once with the fresh SHA
+        # so the playbook learns correctly. Two attempts is enough;
+        # a third is more likely to indicate a real conflict than
+        # bobbling.
+        for attempt in (1, 2):
+            sha, raw = await self._get_file(path)
+            new_text = _append_to_playbook(raw, entry)
+            payload: dict[str, Any] = {
+                'message': f'playbook: {entry.kind} on {entry.repo} ({entry.task_id})',
+                'content': base64.b64encode(new_text.encode()).decode(),
+                'branch': self._base_branch,
+            }
+            if sha is not None:
+                payload['sha'] = sha
+            response = await self._http.put(
+                f'/repos/{self._owner}/{self._repo}/contents/{path}',
+                json=payload,
+            )
+            if response.status_code == 409 and attempt == 1:
+                continue
+            response.raise_for_status()
+            return
 
     async def propose_low_stakes_change(
         self, file: str, new_content: str, rationale: str
