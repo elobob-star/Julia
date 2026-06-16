@@ -282,33 +282,120 @@ class Orchestrator:
             # Live wire does not always carry a pullRequestUrl on
             # sessionCompleted (verified 2026-06-16 -- a single-line
             # CANARY.md task completed successfully but never reached
-            # the PR stage). We do not auto-apply patches because
-            # vision section 18 lists "history rewrites / destructive
-            # ops / new spend" as never-automated; opening a PR
-            # from a patch on someone else's behalf bridges into
-            # that territory. The right move is to surface the patch
-            # to the owner -- file as QUEUED_NEEDS_REVIEW (a new
-            # state) so they can decide.
+            # the PR stage). Two paths:
+            #
+            #   - NO_PATCH path: surface to the owner that nothing
+            #     arrived and let them rerun.
+            #   - PATCH path: if a git_patch artifact arrived AND
+            #     the autonomy ladder is at SUPERVISED or higher,
+            #     publish the patch through ``publish_jules_outputs``
+            #     so an actual GitHub PR exists for the rest of the
+            #     spine (_poll_behavior_prs / /approve).
+            #
+            # Below SUPERVISED the patch is a real surface area but
+            # not yet a public record; the right posture is to leave
+            # the task AWAITING_APPROVAL so the owner can decide
+            # whether to publish, edit, or skip. (Vision §18 lists
+            # 'history rewrites / destructive ops / new spend' as
+            # never-automated; opening a fresh PR is neither, but the
+            # rung control keeps that call with the operator until
+            # they've opted in.)
             git_patch = dossier.extract_git_patch(activity)
             if git_patch:
-                self.store.record_decision(
-                    'orchestrator',
-                    'patch_unapplied',
-                    f'jules completed without opening a PR; patch bytes={len(git_patch)}; awaiting owner decision',
-                    task.id,
-                    meta={'kind': 'completion', 'patch_bytes': len(git_patch)},
-                )
-                task.state = TaskState.AWAITING_APPROVAL
-                task.error = 'jules did not open a PR; owner to apply patch or rerun'
-                task.pr_url = ''  # explicit
-                self.store.save_task(task)
-                await self.gateway.send(
-                    f'Task {task.id} completed but Jules did not open a PR. '
-                    f'Patch captured ({len(git_patch)} bytes). Decision recorded; '
-                    f'apply manually or rerun.'
-                )
-                await self._record('info', task, gist='Jules returned a patch, not a PR. Awaiting owner.')
-                return
+                if self.ladder.allows_publish(task.repo):
+                    try:
+                        base_sha = await self.github.get_default_branch_sha(task.repo)
+                        title = f"julia: {task.prompt[:60] or 'patch from Jules'}"
+                        body = (
+                            f"Opened by Julia orchestrator after Jules returned "
+                            f"a {len(git_patch)}-byte patch without a PR URL.\n\n"
+                            f"Original prompt: {task.prompt}\n"
+                            f"Task id: {task.id}\n"
+                        )
+                        new_pr_url = await self.github.publish_jules_outputs(
+                            repo=task.repo,
+                            base_sha=base_sha,
+                            patch_text=git_patch,
+                            title=title,
+                            body=body,
+                        )
+                        task.pr_url = new_pr_url
+                        task.state = TaskState.REVIEWING
+                        self.store.save_task(task)
+                        self.store.record_decision(
+                            'orchestrator',
+                            'patch_published_as_pr',
+                            f'opened PR from {len(git_patch)}-byte Jules patch',
+                            task.id,
+                            meta={'kind': 'completion', 'pr_url': new_pr_url},
+                        )
+                        await self.gateway.send(
+                            f'Task {task.id}: Jules returned a patch; '
+                            f'opened PR {new_pr_url}. PR watcher will pick up '
+                            f'checks from here.'
+                        )
+                        await self._record(
+                            'info', task,
+                            gist=f'Jules returned a patch; opened {new_pr_url}.',
+                        )
+                        # Fall through to the normal REVIEWING path
+                        # below so gates, anomaly bookkeeping, and the
+                        # autonomy-rung merge decision all run on the
+                        # PR we just opened.
+                        pr_url = new_pr_url
+                    except Exception as exc:
+                        # Translator raised (or GitHub rejected). Keep
+                        # the patch in the ledger via a decision trace
+                        # and surface to the owner; do not silently
+                        # drop the work.
+                        task.state = TaskState.AWAITING_APPROVAL
+                        task.error = (
+                            f'patch translation failed: {exc!r}; '
+                            f'owner to apply manually'
+                        )
+                        self.store.save_task(task)
+                        self.store.record_decision(
+                            'orchestrator',
+                            'patch_publish_failed',
+                            repr(exc), task.id,
+                            meta={'kind': 'completion', 'patch_bytes': len(git_patch)},
+                        )
+                        await self.gateway.send(
+                            f'Task {task.id}: Jules returned a patch but '
+                            f'translation failed ({exc!r}). Awaiting manual '
+                            f'apply or /approve-behavior.'
+                        )
+                        await self._record(
+                            'failure', task,
+                            gist=f'Could not open PR from Jules patch ({exc!r}).',
+                        )
+                        return
+                else:
+                    # Below SUPERVISED the publisher isn't authorised;
+                    # record the patch but don't apply it. Rung <= 1
+                    # means "operator wants to see the change before
+                    # anything happens" -- so we defer.
+                    self.store.record_decision(
+                        'orchestrator',
+                        'patch_unapplied',
+                        f'jules completed without opening a PR; patch bytes={len(git_patch)}; awaiting owner decision',
+                        task.id,
+                        meta={'kind': 'completion', 'patch_bytes': len(git_patch)},
+                    )
+                    task.state = TaskState.AWAITING_APPROVAL
+                    task.error = 'jules did not open a PR; owner to apply patch or rerun'
+                    task.pr_url = ''  # explicit
+                    self.store.save_task(task)
+                    await self.gateway.send(
+                        f'Task {task.id} completed but Jules did not open a PR. '
+                        f'Patch captured ({len(git_patch)} bytes). '
+                        f'Rung below SUPERVISED; awaiting owner decision.'
+                    )
+                    await self._record(
+                        'info', task,
+                        gist='Jules returned a patch, not a PR. Awaiting owner.',
+                    )
+                    return
         if not pr_url:
             raise RuntimeError('session completed without producing a pull request')
         task.pr_url = pr_url

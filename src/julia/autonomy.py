@@ -68,3 +68,17 @@ class AutonomyLadder:
 
     def allows_merge(self, repo: str | None = None) -> bool:
         return self.current(repo) >= Rung.AUTO_NOTIFY
+
+    def allows_publish(self, repo: str | None = None) -> bool:
+        '''Permission to open a fresh PR from a Jules patch artifact.
+
+        Distinct from ``allows_merge`` because opening a PR is a single
+        write-step (one PUT, one POST), whereas merging closes a
+        review. Vision §18 says 'new spend / history rewrites /
+        destructive ops' is never-automated; opening a fresh PR is
+        neither, but PROPOSE_ONLY and SAFE_MODE are explicitly meant
+        to suppress autonomous actions, so publishing follows that
+        gate. Mirrored at SUPERVISED to match Jules execution; below
+        that the operator records the patch but doesn't apply it.
+        '''
+        return self.current(repo) >= Rung.SUPERVISED

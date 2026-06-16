@@ -205,3 +205,157 @@ async def test_approve_behavior_unknown_token_is_courteous(tmp_path):
         Incoming('/approve-behavior https://github.com/no/such/pr', 'owner')
     )
     assert any('No /improve task' in text for text in gateway.sent)
+
+
+async def test_completed_session_with_patch_is_published_as_pr(tmp_path):
+    """When Jules completed but didn't open a PR (only a gitPatch
+    artifact arrived) AND the autonomy rung is SUPERVISED or higher,
+    the orchestrator publishes the patch through GitHub's translator
+    so the rest of the spine (CI polling, /approve-behavior) has a
+    real PR to act on. Below SUPERVISED the patch is recorded but
+    not applied.
+    """
+    from julia.autonomy import Rung
+    settings = Settings(
+        _env_file=None,
+        dry_run=True,
+        state_dir=tmp_path,
+        default_repo='acme/app',
+        poll_interval_s=0,
+        poll_prs_interval_s=0,
+    )
+    store = Store(tmp_path / 'julia.db')
+    github = FakeGitHubClient(checks_pass=True)
+
+    # Build a FakeJulesClient that emits only a gitPatch artifact on
+    # session_completed (no pullRequestUrl) so we exercise the new path.
+    fake_jules = FakeJulesClient()
+    real_list_activities = fake_jules.list_activities
+
+    async def patch_only_list_activities(session_id: str):
+        activities = await real_list_activities(session_id)
+        # Drop the completion entry; add a replacement that carries
+        # only an artifacts[].changeSet.gitPatch.
+        activities = [
+            a for a in activities
+            if a.get('type') != 'session_completed'
+        ]
+        activities.append({
+            'type': 'session_completed',
+            # Note: NO pullRequestUrl here.
+            'artifacts': [{
+                'changeSet': {
+                    'source': 'sources/github/acme/app',
+                    'gitPatch': {
+                        'unidiffPatch': (
+                            'diff --git a/CANARY.md b/CANARY.md\n'
+                            'new file mode 100644\n'
+                            '--- /dev/null\n'
+                            '+++ b/CANARY.md\n'
+                            '@@ -0,0 +1 @@\n'
+                            '+jules-only-patch-no-pr\n'
+                        ),
+                    },
+                },
+            }],
+        })
+        return activities
+
+    fake_jules.list_activities = patch_only_list_activities  # type: ignore[assignment]
+    gateway = MemoryGateway()
+    orchestrator = Orchestrator(
+        settings, store, fake_jules, github, RuleBasedModel(), gateway,
+    )
+    # SUPERVISED => publishing gate at rung >= 2 is open.
+    orchestrator.ladder.set_rung(Rung.SUPERVISED, 'test')
+
+    await orchestrator.handle_message(
+        Incoming('Make a CANARY.md line', 'owner')
+    )
+    await drain(orchestrator)
+
+    # After publish + gates-pass, the task ends AWAITING_APPROVAL on
+    # rung SUPERVISED (which doesn't auto-merge) — the precise state
+    # is one of MERGED / AWAITING_APPROVAL depending on rung. SUPERVISED
+    # here so we expect AWAITING_APPROVAL. The contract under test
+    # is that publishing actually happened, not the merge step.
+    all_tasks = store.list_tasks()
+    assert all_tasks, 'task must exist end-to-end'
+    task = all_tasks[0]
+    assert task.pr_url, 'orchestrator must have published a PR from the patch'
+    assert task.pr_url.startswith('https://github.com/acme/app/pull/'), (
+        f'PR URL came from the patch translator; got {task.pr_url!r}'
+    )
+    # The new decision 'patch_published_as_pr' should be visible.
+    actions = {a for _, _, a, _, _ in store.decisions_for(task.id)}
+    assert 'patch_published_as_pr' in actions
+    # The Fake's translator-recorded patch record should mention the
+    # right repo and carry the exact patch bytes.
+    matching = [p for p in github.applied_patches if p['repo'] == 'acme/app']
+    assert matching, 'publish_jules_outputs must have been called'
+    assert matching[0]['patch_text'].startswith('diff --git a/CANARY.md')
+    # Transparency to the owner.
+    assert any('opened PR' in text for text in gateway.sent)
+
+
+async def test_completed_session_with_patch_held_below_supervised(tmp_path):
+    """Mirror of the test above but with publish gated off.
+
+    PROPOSE_ONLY (rung 1) refuses execution entirely, so it can't
+    drive this code path. Instead, force ``allows_publish`` to deny
+    on a rung where execution is allowed, asserting the orchestrator
+    records patch_unapplied *without* making any GitHub call.
+    """
+    settings = Settings(
+        _env_file=None,
+        dry_run=True,
+        state_dir=tmp_path,
+        default_repo='acme/app',
+        poll_interval_s=0,
+        poll_prs_interval_s=0,
+    )
+    store = Store(tmp_path / 'julia.db')
+    github = FakeGitHubClient()
+    fake_jules = FakeJulesClient()
+    real_list_activities = fake_jules.list_activities
+
+    async def patch_only_list_activities(session_id: str):
+        activities = await real_list_activities(session_id)
+        activities = [
+            a for a in activities
+            if a.get('type') != 'session_completed'
+        ]
+        activities.append({
+            'type': 'session_completed',
+            'artifacts': [{
+                'changeSet': {
+                    'source': 'sources/github/acme/app',
+                    'gitPatch': {'unidiffPatch': 'diff --git a/x b/x\n'},
+                },
+            }],
+        })
+        return activities
+
+    fake_jules.list_activities = patch_only_list_activities  # type: ignore[assignment]
+    gateway = MemoryGateway()
+    orchestrator = Orchestrator(
+        settings, store, fake_jules, github, RuleBasedModel(), gateway,
+    )
+    # Stub allows_publish to deny without touching the rest of the
+    # ladder (else PROPOSE_ONLY refuses intake and never reaches
+    # _on_completed). Default rung is AUTO_NOTIFY so allows_execution
+    # already returns True.
+    orchestrator.ladder.allows_publish = lambda repo=None: False  # type: ignore[assignment]
+
+    await orchestrator.handle_message(
+        Incoming('Patch-only, publishing disabled', 'owner')
+    )
+    await drain(orchestrator)
+    awaiting_tasks = store.list_tasks(TaskState.AWAITING_APPROVAL)
+    assert awaiting_tasks, 'task must end up AWAITING_APPROVAL when patch held'
+    task = awaiting_tasks[0]
+    actions = {a for _, _, a, _, _ in store.decisions_for(task.id)}
+    assert 'patch_unapplied' in actions
+    assert not task.pr_url
+    assert github.applied_patches == []
+    assert any('Patch captured' in text for text in gateway.sent)
