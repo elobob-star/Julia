@@ -73,6 +73,20 @@ class Store:
                 "ALTER TABLE decisions ADD COLUMN meta TEXT",
                 sqlite3.OperationalError,
             ),
+            (
+                # Step 4: behaviour PR tasks carry kind so the
+                # decision pipeline can distinguish them from
+                # ordinary Jules-driven tasks.
+                "ALTER TABLE tasks ADD COLUMN kind TEXT DEFAULT 'dev'",
+                sqlite3.OperationalError,
+            ),
+            (
+                # Step 4: source_url is the editor's return value;
+                # html_url (GitHub) or commit SHA (local) or
+                # fake-string prefix (dry-run).
+                "ALTER TABLE tasks ADD COLUMN source_url TEXT",
+                sqlite3.OperationalError,
+            ),
         ]
         for ddl, exc_type in migrations:
             try:

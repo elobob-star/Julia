@@ -150,6 +150,52 @@ async def test_orchestrator_improve_command(tmp_path):
     [change] = editor.changes
     assert change[0] is Category.LOW_STAKES
     assert any('Low-stakes change' in text for text in gateway.sent)
+    # Step 4: the /improve flow should have created a Task of kind
+    # ``behavior_pr`` with state AWAITING_APPROVAL and a populated
+    # ``source_url`` so a future /approve-behavior can find it by URL.
+    behavior_tasks = [
+        t for t in store.list_tasks()
+        if getattr(t, 'kind', 'dev') == 'behavior_pr'
+    ]
+    assert behavior_tasks, '/improve should create a behavior_pr Task'
+    task = behavior_tasks[0]
+    assert task.state.value == 'awaiting_approval'
+    assert task.source_url and task.source_url.startswith('fake-')
+    # Decision traces reference the new task id and the editor's token.
+    decisions = store.decisions_for(task.id)
+    actions = [action for _at, _actor, action, _reason, _meta in decisions]
+    assert 'improve_requested' in actions
+    assert 'editor_returned' in actions
+
+
+async def test_orchestrator_improve_refuses_locked_path(tmp_path):
+    """Safety categoriser refuses unsafe paths; the Task is recorded
+    as FAILED so /explain still surfaces what happened."""
+    settings = Settings(
+        _env_file=None,
+        dry_run=True,
+        state_dir=tmp_path,
+        default_repo='acme/app',
+        poll_interval_s=0,
+    )
+    store = Store(tmp_path / 'julia.db')
+    editor = FakeBehaviorEditor()
+    gateway = MemoryGateway()
+    orchestrator = Orchestrator(
+        settings, store, FakeJulesClient(), FakeGitHubClient(),
+        RuleBasedModel(), gateway, behavior=editor,
+    )
+    await orchestrator.handle_message(
+        Incoming('/improve policies/safety.md:behavioural rewrite', 'owner')
+    )
+    behavior_tasks = [
+        t for t in store.list_tasks()
+        if getattr(t, 'kind', 'dev') == 'behavior_pr'
+    ]
+    assert behavior_tasks
+    task = behavior_tasks[0]
+    assert task.state.value == 'failed'
+    assert 'safety' in (task.error or '').lower() or 'locked' in (task.error or '').lower()
 
 
 async def test_orchestrator_improve_refuses_without_editor(tmp_path):

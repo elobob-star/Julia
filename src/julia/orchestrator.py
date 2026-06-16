@@ -401,7 +401,10 @@ class Orchestrator:
 
         Routes a behaviour change through ``BehaviorEditor``. ``None``
         editor returns a courteous refusal; locked paths return a
-        hard denial (vision section 18).
+        hard denial (vision section 18). Every ``/improve`` creates a
+        ``Task`` of kind ``behavior_pr`` so ``/explain``, the daily
+        digest, and a future ``/approve-behavior`` can reference the
+        PR by stable task id.
         '''
         if self.behavior is None:
             await self.gateway.send(
@@ -418,22 +421,92 @@ class Orchestrator:
         # text unchanged (this is a touch-up, not a wholesale rewrite).
         # The editor will still record the rationale and category.
         new_content = ' '.join(args[1:]).strip() if len(args) > 1 else ''
-        if category_label == 'low-stakes':
-            sha = await self.behavior.propose_low_stakes_change(
-                target_file, new_content, rationale=f'proposed via gateway on {target_file}'
-            )
-            await self.gateway.send(f'Low-stakes change opened (commit {sha[:12]}).')
-        elif category_label == 'behavioural':
-            sha = await self.behavior.propose_behavioral_change(
-                target_file, new_content, rationale=f'proposed via gateway on {target_file}'
+        # Step 4: persist a Task up front so the decision trace and
+        # ``/explain`` reference a stable id regardless of how the
+        # editor's HTTP call ends. The Task is created with state
+        # AWAITING_APPROVAL since both low-stakes and behavioural
+        # require either auto-merge (Step 5) or owner approval.
+        from .behavior.editor import BehaviorDenied  # local import; categoriser raises this
+        task = Task(
+            id=new_id(),
+            prompt=target_file,
+            repo='behaviors',
+            kind='behavior_pr',
+            state=TaskState.AWAITING_APPROVAL,
+        )
+        self.store.save_task(task)
+        self.store.record_decision(
+            'owner', 'improve_requested',
+            f'proposed {category_label} change to {target_file}',
+            task.id, meta={'kind': category_label, 'file': target_file},
+        )
+        try:
+            if category_label == 'low-stakes':
+                editor_token = await self.behavior.propose_low_stakes_change(
+                    target_file, new_content,
+                    rationale=f'proposed via gateway on {target_file}',
+                )
+                self.store.record_decision(
+                    'orchestrator', 'editor_returned', 'low-stakes PR opened', task.id,
+                )
+                await self.gateway.send(
+                    f'Low-stakes change opened for task {task.id}: {target_file} '
+                    f'(PR: {editor_token})'
+                )
+            elif category_label == 'behavioural':
+                editor_token = await self.behavior.propose_behavioral_change(
+                    target_file, new_content,
+                    rationale=f'proposed via gateway on {target_file}',
+                )
+                self.store.record_decision(
+                    'orchestrator', 'editor_returned',
+                    'behavioural PR opened, awaiting manual review', task.id,
+                )
+                await self.gateway.send(
+                    f'Behavioural change opened for task {task.id}: {target_file} '
+                    f'- awaiting manual review. (PR: {editor_token})'
+                )
+            else:
+                task.state = TaskState.FAILED
+                task.error = f'unknown category {category_label!r}'
+                self.store.save_task(task)
+                self.store.record_decision(
+                    'orchestrator', 'improve_rejected',
+                    f'unknown category {category_label!r}', task.id,
+                )
+                await self.gateway.send(
+                    f'Unknown category {category_label!r}; expected low-stakes or behavioural.'
+                )
+                return
+        except BehaviorDenied as exc:
+            task.state = TaskState.FAILED
+            task.error = str(exc)
+            self.store.save_task(task)
+            self.store.record_decision(
+                'orchestrator', 'improve_refused', str(exc), task.id,
+                meta={'refusal_stage': 'category'},
             )
             await self.gateway.send(
-                f'Behavioural change opened (commit {sha[:12]}) - awaiting manual review.'
+                f'/improve refused: {exc} (task {task.id} marked failed).'
             )
-        else:
+            return
+        except Exception as exc:
+            task.state = TaskState.FAILED
+            task.error = repr(exc)
+            self.store.save_task(task)
+            self.store.record_decision(
+                'orchestrator', 'improve_failed', repr(exc), task.id,
+            )
             await self.gateway.send(
-                f'Unknown category {category_label!r}; expected low-stakes or behavioural.'
+                f'/improve failed: {exc!r} (task {task.id} marked failed).'
             )
+            return
+        # Persist the editor's token so ``/approve-behavior`` (Step 5)
+        # can find this task by URL, and so the daily digest can
+        # surface it. ``editor_token`` is the editor's native return
+        # value: html_url on GitHub, SHA on local, fake-prefix on dry.
+        task.source_url = editor_token
+        self.store.save_task(task)
 
     async def _playbook_summary(self, task_id: str | None) -> str:
         '''Filter decision traces to those whose meta carries a ``kind``.
