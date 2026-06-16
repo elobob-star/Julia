@@ -1,0 +1,225 @@
+"""Behavior editor: the orchestrator's bridge to its own behavior repo.
+
+Three small Protocol methods (``record_playbook_entry``,
+``propose_low_stakes_change``, ``propose_behavioral_change``) and
+three implementations (Fake, Local, GitHub). Backwards compat:
+the orchestrator treats ``None`` as "no editor" and behaves exactly
+as it did before this module existed.
+"""
+
+from __future__ import annotations
+
+import enum
+import re
+import subprocess  # nosec - B603
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Protocol
+
+# Don't lose track: the engineer's behavior (Claude Fable 5) reads
+# safety.md but never edits it through this surface. The denylist is
+# the line that holds (vision section 8 + section 15).
+DENYLIST = re.compile(
+    r"(secret|password|credential|\.env$|\.key$|token)",
+    re.IGNORECASE,
+)
+LOCKED_FILES = frozenset({"policies/safety.md"})
+LOW_STAKES_DIRS = ("playbook/", "prompts/")
+BEHAVIOURAL_DIRS = ("policies/",)
+SECRET_KEYS = re.compile(r"(secret|password|token|api.?key)", re.IGNORECASE)
+
+
+class BehaviorDenied(RuntimeError):
+    """Raised when the editor refuses to write a behavior change."""
+
+
+class Category(str, enum.Enum):
+    LOW_STAKES = "low-stakes"
+    BEHAVIOURAL = "behavioural"
+    LOCKED = "locked"
+
+
+def categorise(file: str) -> Category:
+    """Resolve a path's category.
+
+    Denied paths raise :class:`BehaviorDenied` regardless of caller.
+    The orchestrator never overrides this.
+    """
+    if file in LOCKED_FILES:
+        raise BehaviorDenied(f"refusing to open a PR against locked file {file!r}")
+    if DENYLIST.search(file):
+        raise BehaviorDenied(f"refusing to open a PR: {file!r} matches the safety denylist")
+    if any(file.startswith(prefix) for prefix in BEHAVIOURAL_DIRS):
+        return Category.BEHAVIOURAL
+    if any(file.startswith(prefix) for prefix in LOW_STAKES_DIRS):
+        return Category.LOW_STAKES
+    raise BehaviorDenied(
+        f"refusing to open a PR against {file!r}: not under a tracked directory"
+    )
+
+
+def filter_meta(meta: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Filter secret-shaped keys out of a decision meta dict.
+
+    Vision section 15: *logs and analytics never contain secret
+    values*. The orchestrator calls this once before persisting or
+    forwarding meta on the wire.
+    """
+    if meta is None:
+        return None
+    return {k: v for k, v in meta.items() if not SECRET_KEYS.search(str(k))}
+
+
+@dataclass
+class PlaybookEntry:
+    """One append-only entry into the behavioral playbook.
+
+    ``task_id`` defaults to the originating decision's task id. The
+    orchestrator passes ``extra`` as a ``meta`` filtered object so
+    the playbook never stores raw credentials by accident.
+    """
+
+    kind: str  # 'plan' | 'question' | 'drift' | 'completion' | 'failure' | 'info'
+    repo: str  # owner/name
+    task_id: str
+    gist: str
+    extra: dict[str, Any] | None = None
+
+    def render(self) -> str:
+        date = self.extra.get("date", "") if self.extra else ""
+        date_part = f" ({date})" if date else ""
+        extra_part = ""
+        if self.extra:
+            kept = {k: v for k, v in self.extra.items() if k != "date"}
+            if kept:
+                extra_part = "\n  meta: " + repr(kept)
+        return (
+            f"## kind={self.kind}{date_part} - repo={self.repo} - task={self.task_id}\n"
+            f"{self.gist.strip()}"
+            f"{extra_part}\n"
+        )
+
+
+class BehaviorEditor(Protocol):
+    """The orchestrator's write surface for its own behavior.
+
+    Backwards compat: callers may pass ``None`` and skip writes;
+    the protocol is intentionally narrow so a Fake implementation
+    can pin test expectations without dragging in the rest of the
+    editor machinery.
+    """
+
+    async def record_playbook_entry(self, entry: PlaybookEntry) -> None: ...
+
+    async def propose_low_stakes_change(
+        self, file: str, new_content: str, rationale: str
+    ) -> str: ...
+
+    async def propose_behavioral_change(
+        self, file: str, new_content: str, rationale: str
+    ) -> str: ...
+
+
+@dataclass
+class FakeBehaviorEditor:
+    """Test/dry-run behavior editor. Records every call."""
+
+    entries: list[PlaybookEntry] = field(default_factory=list)
+    changes: list[tuple[Category, str, str]] = field(default_factory=list)
+
+    async def record_playbook_entry(self, entry: PlaybookEntry) -> None:
+        self.entries.append(entry)
+
+    async def propose_low_stakes_change(
+        self, file: str, new_content: str, rationale: str
+    ) -> str:
+        category = categorise(file)
+        if category is not Category.LOW_STAKES:
+            raise BehaviorDenied(
+                f"propose_low_stakes_change called on {file!r}: not low-stakes"
+            )
+        self.changes.append((category, file, rationale))
+        return f"fake-low-stakes:{file}"
+
+    async def propose_behavioral_change(
+        self, file: str, new_content: str, rationale: str
+    ) -> str:
+        category = categorise(file)
+        if category is not Category.BEHAVIOURAL:
+            raise BehaviorDenied(
+                f"propose_behavioral_change called on {file!r}: not behavioural"
+            )
+        self.changes.append((category, file, rationale))
+        return f"fake-behavioural:{file}"
+
+
+@dataclass
+class LocalBehaviorEditor:
+    """Commits behaviour changes to a local git checkout of the behaviors repo.
+
+    Mirrors ``behaviors/scripts/self_improve.py`` for parity with the
+    git cli workflow. The orchestrator configures this when
+    ``--behaviors PATH`` is set; ``GitHubBehaviorEditor`` will replace
+    it once the behaviors repo lands on GitHub in Phase 3.
+    """
+
+    repo: Path
+
+    async def record_playbook_entry(self, entry: PlaybookEntry) -> None:
+        kind_pattern = r"^(plan|question|drift|completion|failure|info)$"
+        if not re.match(kind_pattern, entry.kind):
+            raise ValueError(f"invalid playground kind: {entry.kind!r}")
+        target = self.repo / "playbook" / "jules-playbook.md"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if not target.exists():
+            target.write_text(
+                "# Jules Behavioral Playbook\n\n"
+                "<!-- empty; populated by LocalBehaviorEditor -->\n"
+            )
+        with target.open("a") as handle:
+            handle.write("\n" + entry.render() + "\n")
+
+    async def propose_low_stakes_change(
+        self, file: str, new_content: str, rationale: str
+    ) -> str:
+        return await _commit(self.repo, file, Category.LOW_STAKES, new_content, rationale)
+
+    async def propose_behavioral_change(
+        self, file: str, new_content: str, rationale: str
+    ) -> str:
+        return await _commit(self.repo, file, Category.BEHAVIOURAL, new_content, rationale)
+
+
+async def _commit(
+    repo: Path, file: str, expected: Category, content: str, rationale: str
+) -> str:
+    """Shared backing for the two ``propose_*`` methods.
+
+    Reads the file's existing category out of the safety categoriser;
+    rejects any call that asks for a category other than the file's.
+    """
+    actual = categorise(file)
+    if actual is not expected:
+        raise BehaviorDenied(
+            f"category mismatch for {file!r}: file is {actual.value}, "
+            f"requested {expected.value}"
+        )
+    target = repo / file
+    if not target.exists():
+        raise BehaviorDenied(
+            f"{target} is not in the repo; refusing to invent a path"
+        )
+    target.write_text(content)
+    _git(["add", file], repo)
+    _git(["commit", "-m", f"{expected.value}: {rationale}"], repo)
+    return _git(["rev-parse", "HEAD"], repo)
+
+
+def _git(args: list[str], repo: Path) -> str:
+    return subprocess.run(  # nosec - B603
+        ["git", *args],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
