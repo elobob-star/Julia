@@ -62,14 +62,29 @@ To enable the behavioural playbook (vision §8) so Julia learns
 from each session and opens reviewable PRs against its own
 behaviour repo:
 
+**Live (preferred):** point Julia at the GitHub repo so every
+behaviour change opens a real PR through the GitHub API.
+
+```bash
+export JULIA_BEHAVIORS_REPO=elobob-star/behaviors
+# JULIA_GITHUB_TOKEN is already required for live runs
+julia run
+```
+
+`JULIA_BEHAVIORS_REPO` takes precedence over `JULIA_BEHAVIORS_PATH`.
+Playbook entries commit *directly* to `main` (append-only data,
+never policy); low-stakes prompt changes and behavioural policy
+changes both go through PR review on the configured repo.
+
+**Offline:** for development without network calls:
+
 ```bash
 julia run --behaviors /path/to/behaviors
 ```
 
 `/path/to/behaviors` should be a git checkout of the **behaviors**
-repo (sibling of `julia-main/`). The orchestrator will write
-playbook entries into `playbook/jules-playbook.md` and route low-
-stakes prompt changes through the same pipeline it uses for code.
+repo (sibling of `julia-main/`). Playbook entries write straight
+to the local file; prompt / policy changes commit locally.
 
 ---
 

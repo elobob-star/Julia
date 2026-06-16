@@ -9,12 +9,17 @@ as it did before this module existed.
 
 from __future__ import annotations
 
+import base64
 import enum
 import re
 import subprocess  # nosec - B603
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
+
+import httpx
+import time as _time
+import uuid as _uuid
 
 # Don't lose track: the engineer's behavior (Claude Fable 5) reads
 # safety.md but never edits it through this surface. The denylist is
@@ -223,3 +228,186 @@ def _git(args: list[str], repo: Path) -> str:
         capture_output=True,
         text=True,
     ).stdout.strip()
+
+# ----------- GitHub implementation (vision section 8, networked) -----------
+
+class GitHubBehaviorEditor:
+    """Open real PRs against a remote ``behaviors`` repo on GitHub.
+
+    Two flows:
+
+    * :meth:`record_playbook_entry` writes a small append-only block
+      straight to ``main`` via the contents API. The playbook is
+      *data*, append-only, never policy -- so committing to ``main``
+      is the right shape and matches the offline editor's semantics.
+    * :meth:`propose_low_stakes_change` /
+      :meth:`propose_behavioral_change` create a feature branch and
+      open a PR. Behavioural PRs surface in the gateway for owner
+      approval; low-stakes ones auto-merge after the prompt
+      regression suite in the ``behaviors`` repo passes (vision
+      section 5.4 + 8).
+
+    The safety categoriser runs first; locked paths raise
+    :class:`BehaviorDenied` *before* any HTTP call. The editor never
+    reaches a GitHub endpoint for a refused file.
+    """
+
+    def __init__(
+        self,
+        token: str,
+        owner: str,
+        repo: str,
+        base_branch: str = 'main',
+    ) -> None:
+        self._owner = owner
+        self._repo = repo
+        self._base_branch = base_branch
+        self._http = httpx.AsyncClient(
+            base_url='https://api.github.com',
+            headers={
+                'Authorization': f'Bearer {token}',
+                'Accept': 'application/vnd.github+json',
+                'X-GitHub-Api-Version': '2022-11-28',
+            },
+            timeout=30.0,
+        )
+
+    async def aclose(self) -> None:
+        await self._http.aclose()
+
+    async def record_playbook_entry(self, entry: PlaybookEntry) -> None:
+        path = 'playbook/jules-playbook.md'
+        sha, raw = await self._get_file(path)
+        new_text = _append_to_playbook(raw, entry)
+        payload: dict[str, Any] = {
+            'message': f'playbook: {entry.kind} on {entry.repo} ({entry.task_id})',
+            'content': base64.b64encode(new_text.encode()).decode(),
+            'branch': self._base_branch,
+        }
+        if sha is not None:
+            payload['sha'] = sha
+        response = await self._http.put(
+            f'/repos/{self._owner}/{self._repo}/contents/{path}',
+            json=payload,
+        )
+        response.raise_for_status()
+
+    async def propose_low_stakes_change(
+        self, file: str, new_content: str, rationale: str
+    ) -> str:
+        return await self._open_pr(file, Category.LOW_STAKES, new_content, rationale)
+
+    async def propose_behavioral_change(
+        self, file: str, new_content: str, rationale: str
+    ) -> str:
+        return await self._open_pr(file, Category.BEHAVIOURAL, new_content, rationale)
+
+    async def _open_pr(
+        self, file: str, expected: Category, content: str, rationale: str
+    ) -> str:
+        actual = categorise(file)
+        if actual is not expected:
+            raise BehaviorDenied(
+                f'category mismatch for {file!r}: file is {actual.value}, '
+                f'requested {expected.value}'
+            )
+        # Branch names carry timestamp + slug so parallel PRs from
+        # concurrent sessions do not collide.
+        slug = re.sub(r'[^a-z0-9]+', '-', file.lower()).strip('-')
+        branch = f'self-improve/{int(_time.time())}-{_uuid.uuid4().hex[:6]}-{slug}'
+        await self._create_branch(branch)
+        sha = await self._get_file_sha(file)
+        payload: dict[str, Any] = {
+            'message': f'{expected.value}: {rationale}',
+            'content': base64.b64encode(content.encode()).decode(),
+            'branch': branch,
+        }
+        if sha is not None:
+            payload['sha'] = sha
+        response = await self._http.put(
+            f'/repos/{self._owner}/{self._repo}/contents/{file}',
+            json=payload,
+        )
+        response.raise_for_status()
+        pr = await self._http.post(
+            f'/repos/{self._owner}/{self._repo}/pulls',
+            json={
+                'title': f'{expected.value}: {rationale_short(rationale)}',
+                'head': branch,
+                'base': self._base_branch,
+                'body': (
+                    f'Category: **{expected.value}**\n\n'
+                    f'File: `{file}`\n\nRationale: {rationale}\n\n'
+                    'Opened by Julia orchestrator (vision section 8).'
+                ),
+                'draft': expected is Category.BEHAVIOURAL,
+            },
+        )
+        pr.raise_for_status()
+        return str(pr.json().get('html_url') or pr.json().get('number'))
+
+    async def _get_file_sha(self, path: str) -> str | None:
+        response = await self._http.get(
+            f'/repos/{self._owner}/{self._repo}/contents/{path}',
+            params={'ref': self._base_branch},
+        )
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        return str(response.json().get('sha'))
+
+    async def _get_file(self, path: str) -> tuple[str | None, str]:
+        """Fetch ``(sha, raw_text)`` in one request to halve round trips."""
+        response = await self._http.get(
+            f'/repos/{self._owner}/{self._repo}/contents/{path}',
+            params={'ref': self._base_branch},
+        )
+        if response.status_code == 404:
+            return None, '# Jules Behavioral Playbook\n\n## Observed shape drift\n'
+        response.raise_for_status()
+        body = response.json()
+        return str(body.get('sha')), base64.b64decode(body['content']).decode()
+
+    async def _get_raw_file(self, path: str) -> str:
+        response = await self._http.get(
+            f'/repos/{self._owner}/{self._repo}/contents/{path}',
+            params={'ref': self._base_branch},
+        )
+        if response.status_code == 404:
+            return '# Jules Behavioral Playbook\n\n## Observed shape drift\n'
+        response.raise_for_status()
+        return base64.b64decode(response.json()['content']).decode()
+
+    async def _create_branch(self, branch: str) -> None:
+        ref_response = await self._http.get(
+            f'/repos/{self._owner}/{self._repo}/git/ref/heads/{self._base_branch}'
+        )
+        ref_response.raise_for_status()
+        base_sha = ref_response.json()['object']['sha']
+        response = await self._http.post(
+            f'/repos/{self._owner}/{self._repo}/git/refs',
+            json={'ref': f'refs/heads/{branch}', 'sha': base_sha},
+        )
+        # 422 means the branch already exists from a previous attempt;
+        # the editor's idempotent retry is the same as a no-op there.
+        if response.status_code not in (201, 422):
+            response.raise_for_status()
+
+
+def _append_to_playbook(text: str, entry: PlaybookEntry) -> str:
+    """Append one playbook entry into the canonical drift header."""
+    kind_pattern = r'^(plan|question|drift|completion|failure|info)$'
+    if not re.match(kind_pattern, entry.kind):
+        raise ValueError(f'invalid playbook kind: {entry.kind!r}')
+    block = '\n' + entry.render() + '\n'
+    header = '## Observed shape drift'
+    if header in text:
+        head, tail = text.split(header, 1)
+        return head + header + block + tail
+    return text + '\n' + header + block
+
+
+def rationale_short(text: str, *, limit: int = 60) -> str:
+    """Trim a rationale to a stable PR-title length."""
+    text = text.strip()
+    return text if len(text) <= limit else text[: limit - 1] + '…'

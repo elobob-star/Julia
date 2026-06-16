@@ -143,7 +143,8 @@ actually need to know:
 | `JULIA_JULES_API_KEY` | Jules API key (required live) |
 | `JULIA_GITHUB_TOKEN` | GitHub access token (required live) |
 | `JULIA_DEFAULT_REPO` | `owner/name` for tasks without an explicit repo |
-| `JULIA_BEHAVIORS_PATH` / `--behaviors PATH` | local checkout of the `behaviors/` repo (vision §8) |
+| `JULIA_BEHAVIORS_PATH` / `--behaviors PATH` | local checkout of the `behaviors/` repo (vision §8); offline-mode editor |
+| `JULIA_BEHAVIORS_REPO` | `owner/name` GitHub repo; live editor (preferred when set) |
 | `JULIA_MODEL_API_KEY` / `JULIA_MODEL_BASE_URL` / `JULIA_MODEL_NAME` | BYOK runtime model |
 | `JULIA_TELEGRAM_BOT_TOKEN` / `JULIA_TELEGRAM_CHAT_ID` | Telegram gateway (else console) |
 | `JULIA_HEARTBEAT_URL` | External dead-man's switch endpoint |

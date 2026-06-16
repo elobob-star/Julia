@@ -39,8 +39,13 @@ class Settings(BaseSettings):
     model_name: str = 'nvidia/nemotron-3-ultra'
 
     # Behavior repo (vision section 8). Optional; the orchestrator
-    # behaves exactly as Phase 1 when absent.
-    behaviors_path: Path | None = None  # local clone of julia-behaviors
+    # behaves exactly as Phase 1 when absent. When ``behaviors_repo``
+    # is set (``owner/name``), the GitHub editor opens real PRs
+    # against it. When only ``behaviors_path`` is set, the local
+    # filesystem editor is used. With both, GitHub wins (live is the
+    # authoritative posture).
+    behaviors_path: Path | None = None
+    behaviors_repo: str | None = None
 
     # Gateway (vision section 12). Telegram if configured, console otherwise.
     telegram_bot_token: SecretStr | None = None

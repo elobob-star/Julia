@@ -14,7 +14,7 @@ import asyncio
 import logging
 from pathlib import Path
 
-from .behavior.editor import LocalBehaviorEditor
+from .behavior.editor import GitHubBehaviorEditor, LocalBehaviorEditor
 from .config import Settings
 from .gateway.console import ConsoleGateway
 from .gateway.telegram import TelegramGateway
@@ -26,9 +26,31 @@ from .state import Store
 
 
 def _build_behavior(settings: Settings):
-    if settings.behaviors_path is None:
-        return None
-    return LocalBehaviorEditor(settings.behaviors_path)
+    """Pick the right editor for the configured posture.
+
+    Precedence: GitHub repo > local path > None. GitHub is the
+    authoritative live posture; local is for offline development;
+    None preserves the Phase 1 spine exactly.
+    """
+    if settings.behaviors_repo:
+        owner, _, name = settings.behaviors_repo.partition('/')
+        if not owner or not name:
+            raise SystemExit(
+                f'JULIA_BEHAVIORS_REPO must be owner/name; got {settings.behaviors_repo!r}'
+            )
+        if not settings.github_token:
+            raise SystemExit(
+                'JULIA_BEHAVIORS_REPO requires JULIA_GITHUB_TOKEN; '
+                'the GitHub editor uses the same token.'
+            )
+        return GitHubBehaviorEditor(
+            token=settings.github_token.get_secret_value(),
+            owner=owner,
+            repo=name,
+        )
+    if settings.behaviors_path is not None:
+        return LocalBehaviorEditor(settings.behaviors_path)
+    return None
 
 
 def build_orchestrator(settings: Settings) -> Orchestrator:
