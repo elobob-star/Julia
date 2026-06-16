@@ -121,3 +121,17 @@ class FakeJulesClient:
         session = self._sessions[session_id]
         if session['phase'] == 'asked':
             session['phase'] = 'completed'
+
+    async def list_artifacts(self, session_id):
+        session = self._sessions[session_id]
+        if session['phase'] != 'completed':
+            return []
+        return [
+            {
+                'changeSet': {
+                    'source': f"sources/github/{session['repo']}",
+                    'gitPatch': {'unidiffPatch': 'fake unidiff'},
+                },
+                'kind': 'gitPatch',
+            }
+        ]
