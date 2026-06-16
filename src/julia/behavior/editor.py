@@ -10,7 +10,6 @@ as it did before this module existed.
 from __future__ import annotations
 
 import base64
-import enum
 import re
 import subprocess  # nosec - B603
 from dataclasses import dataclass, field
@@ -23,44 +22,20 @@ import uuid as _uuid
 
 # Don't lose track: the engineer's behavior (Claude Fable 5) reads
 # safety.md but never edits it through this surface. The denylist is
-# the line that holds (vision section 8 + section 15).
-DENYLIST = re.compile(
-    r"(secret|password|credential|\.env$|\.key$|token)",
-    re.IGNORECASE,
+# the line that holds (vision section 8 + section 15). Resolve through
+# ``_safety`` so the runtime shares one categoriser with
+# ``behaviors/scripts/self_improve.py``; a regression test in
+# ``behaviors/tests/test_safety.py`` pins the equivalence.
+from ._safety import (  # noqa: F401 -- re-export surface for callers
+    DENYLIST,
+    LOCKED_FILES,
+    LOW_STAKES_DIRS,
+    BEHAVIOURAL_DIRS,
+    BehaviorDenied,
+    Category,
+    categorise,
 )
-LOCKED_FILES = frozenset({"policies/safety.md"})
-LOW_STAKES_DIRS = ("playbook/", "prompts/")
-BEHAVIOURAL_DIRS = ("policies/",)
 SECRET_KEYS = re.compile(r"(secret|password|token|api.?key)", re.IGNORECASE)
-
-
-class BehaviorDenied(RuntimeError):
-    """Raised when the editor refuses to write a behavior change."""
-
-
-class Category(str, enum.Enum):
-    LOW_STAKES = "low-stakes"
-    BEHAVIOURAL = "behavioural"
-    LOCKED = "locked"
-
-
-def categorise(file: str) -> Category:
-    """Resolve a path's category.
-
-    Denied paths raise :class:`BehaviorDenied` regardless of caller.
-    The orchestrator never overrides this.
-    """
-    if file in LOCKED_FILES:
-        raise BehaviorDenied(f"refusing to open a PR against locked file {file!r}")
-    if DENYLIST.search(file):
-        raise BehaviorDenied(f"refusing to open a PR: {file!r} matches the safety denylist")
-    if any(file.startswith(prefix) for prefix in BEHAVIOURAL_DIRS):
-        return Category.BEHAVIOURAL
-    if any(file.startswith(prefix) for prefix in LOW_STAKES_DIRS):
-        return Category.LOW_STAKES
-    raise BehaviorDenied(
-        f"refusing to open a PR against {file!r}: not under a tracked directory"
-    )
 
 
 def filter_meta(meta: dict[str, Any] | None) -> dict[str, Any] | None:
