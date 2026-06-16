@@ -29,8 +29,9 @@ from .watchdog import Watchdog
 log = logging.getLogger('julia')
 
 HELP = (
-    'Commands: /status, /digest, /approve <task-id>, /explain <task-id>, '
-    '/playbook [task-id], /improve <file>:<category> <new-content>, '
+    'Commands: /status, /digest, /approve <task-id>, /approve-behavior <pr-url>, '
+    '/explain <task-id>, /playbook [task-id], '
+    '/improve <file>:<category> <new-content>, '
     '/rung <0-4> (0 safe, 1 propose-only, 2 supervised, 3 auto+notify, '
     '4 full auto), /panic, /help. Anything else becomes a development task.'
 )
@@ -71,6 +72,7 @@ class Orchestrator:
         async with asyncio.TaskGroup() as group:
             group.create_task(self.watchdog.run())
             group.create_task(self._daily_loop())
+            group.create_task(self._pr_watcher_loop())
             group.create_task(self._serve())
 
     async def _resume(self) -> None:
@@ -383,6 +385,8 @@ class Orchestrator:
             await self.gateway.send(f'Autonomy rung set to {rung.name}.')
         elif command == '/approve' and args:
             await self._approve(args[0])
+        elif command == '/approve-behavior' and args:
+            await self._approve_behavior(args[0])
         elif command == '/explain' and args:
             decisions = self.store.decisions_for(args[0])
             lines = [
@@ -540,6 +544,151 @@ class Orchestrator:
         self.store.save_task(task)
         self.store.record_decision('owner', 'approved_merge', 'manual approval from gateway', task.id)
         await self.gateway.send(f'Task {task.id} merged: {task.pr_url}')
+
+    async def _approve_behavior(self, pr_token: str) -> None:
+        '''``/approve-behavior <pr-token>``.
+
+        The token is whatever the editor returned when ``/improve``
+        opened the PR — an html_url for GitHub, a SHA for the local
+        editor, a ``fake-...:file`` prefix for the fake editor.
+        Resolved through ``Task.source_url``. Behavioural and
+        low-stakes PRs both go through the same approval route now
+        that the auto-merge watcher (Step 5) is on; the low-stakes
+        ones will usually have already merged by the time the owner
+        sees them. This handler is for the cases the watcher
+        hesitated on.
+        '''
+        task = next(
+            (
+                t for t in self.store.list_tasks()
+                if getattr(t, 'kind', 'dev') == 'behavior_pr'
+                and t.source_url == pr_token
+            ),
+            None,
+        )
+        if task is None:
+            await self.gateway.send(
+                f'No /improve task with token {pr_token}. '
+                f'Pass the html_url printed at /improve time.'
+            )
+            return
+        if task.state not in (TaskState.AWAITING_APPROVAL, TaskState.QUEUED):
+            await self.gateway.send(
+                f'Task {task.id} is in state {task.state.value}; '
+                f'nothing for /approve-behavior to merge.'
+            )
+            return
+        try:
+            merged = await self.github.merge_pr(pr_token)
+        except Exception as exc:
+            task.state = TaskState.FAILED
+            task.error = repr(exc)
+            self.store.save_task(task)
+            self.store.record_decision(
+                'orchestrator', 'approve_behavior_failed',
+                repr(exc), task.id,
+            )
+            await self.gateway.send(
+                f'/approve-behavior failed for task {task.id}: {exc!r}'
+            )
+            return
+        task.state = TaskState.MERGED if merged else task.state
+        self.store.save_task(task)
+        self.store.record_decision(
+            'owner', 'approved_behavior_merge',
+            'manual approval from /approve-behavior',
+            task.id,
+            meta={'already_merged': not merged},
+        )
+        await self.gateway.send(
+            f'Behaviour PR for task {task.id} '
+            f'{"already merged" if not merged else "merged"}: {pr_token}'
+        )
+
+    # Step 5: live PR watcher — auto-merges low-stakes PRs whose CI is
+    # green, surfaces failed checks, and never touches a behavioural
+    # PR without owner approval. One asyncio.Task per Orchestrator.run
+    # call; failure in this loop never bubbles out (the orchestrator
+    # stays alive).
+    async def _pr_watcher_loop(self) -> None:
+        while True:
+            try:
+                await asyncio.sleep(self.settings.poll_prs_interval_s)
+                await self._poll_behavior_prs()
+            except Exception:
+                log.exception('pr watcher cycle failed; will retry next interval')
+
+    async def _poll_behavior_prs(self) -> None:
+        # Behaviour PR tasks that need watching: state is one or
+        # AWAITING_APPROVAL (waiting for CI or owner), and source_url
+        # is a real GitHub html_url (not a fake-prefix or local SHA,
+        # which the editor can't auto-poll).
+        candidates = [
+            t for t in self.store.list_tasks(TaskState.AWAITING_APPROVAL)
+            if getattr(t, 'kind', 'dev') == 'behavior_pr'
+            and t.source_url
+            and t.source_url.startswith('http')
+        ]
+        for task in candidates:
+            url = task.source_url
+            assert url is not None  # narrowed by the candidates filter
+            try:
+                passed = await self.github.pr_checks_passed(url)
+            except Exception:
+                # 404 / 422 / network — GitHub isn't ready with the
+                # PR yet. Back off and try again next cycle.
+                self.watchdog.beat(f'pr:{task.id}')
+                continue
+            if not passed:
+                # A check failed or is still running; surface the
+                # failure once via the gateway and stay in
+                # AWAITING_APPROVAL.
+                self.store.record_decision(
+                    'orchestrator', 'pr_checks_failed',
+                    'CI gate not green; awaiting owner',
+                    task.id,
+                )
+                await self.gateway.send(
+                    f'Task {task.id}: PR CI not green. '
+                    f'Investigate at {task.source_url}'
+                )
+                continue
+            # CI is green. Branch on category derived from the
+            # target file path stored in task.prompt.
+            is_low_stakes = (
+                task.prompt.startswith('prompts/')
+                or task.prompt.startswith('playbook/')
+            )
+            if is_low_stakes:
+                try:
+                    await self.github.merge_pr(url)
+                except Exception as exc:
+                    self.store.record_decision(
+                        'orchestrator', 'auto_merge_failed',
+                        repr(exc), task.id,
+                    )
+                    await self.gateway.send(
+                        f'PR for task {task.id} is green but merge failed: '
+                        f'{exc!r}. Awaiting manual /approve-behavior.'
+                    )
+                    continue
+                task.state = TaskState.MERGED
+                self.store.save_task(task)
+                self.store.record_decision(
+                    'orchestrator', 'auto_merged',
+                    'low-stakes PR auto-merged after green CI',
+                    task.id,
+                )
+                await self.gateway.send(
+                    f'Task {task.id} auto-merged: {task.source_url}'
+                )
+            else:
+                # Behavioural: never auto-merge.
+                self.store.record_decision(
+                    'orchestrator', 'pr_ready_for_owner',
+                    'CI green; awaiting /approve-behavior', task.id,
+                )
+                self.watchdog.beat(f'pr:{task.id}')
 
     # Reporting -------------------------------------------------------------
     def _status_text(self) -> str:
