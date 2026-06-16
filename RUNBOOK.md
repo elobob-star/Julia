@@ -203,6 +203,11 @@ The orchestrator's `_resume` rehydrates in-flight tasks (`PLANNING`,
   routing.
 
   ✅ **Delivered in this build** — see `behaviors/`.
+  The prompt regression suite now runs on every push via
+  `elobob-star/behaviors/.github/workflows/test-prompts.yml`.
+  Low-stakes behaviour PRs auto-merge after that workflow goes
+  green; behavioural ones stay in `AWAITING_APPROVAL` until
+  `/approve-behavior <pr-url>` is sent.
 - **Phase 3** — Polish: gateway UX, repo onboarding wizard, task
   templates, NotebookLM adapter.
 

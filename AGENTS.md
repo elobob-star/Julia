@@ -30,18 +30,27 @@ Julia/
   src/julia/
     cli.py             argparse entry point; wires Settings → collaborators → Orchestrator
     config.py          pydantic-settings Settings; the JULIA_ env namespace
-    models.py          Task, TaskState, ids, JSON round-trip
+    models.py          Task, TaskState, ids, JSON round-trip (kind + source_url added in Phase 2)
     orchestrator.py    the core loop (intake → session → review → merge → notify)
+                       plus _pr_watcher_loop and _approve_behavior
     autonomy.py        the five-rung autonomy ladder
     quota.py           rolling 24h Jules quota guard with canary reserve
     state.py           SQLite Store: tasks / decisions / quota / kv / backup
     watchdog.py        in-process watchdog + external heartbeat pings
-    behavior/          vision §8 PR opener (Fake + Local editors + safety denylist)
+    behavior/          vision §8 PR opener (Fake + Local + GitHub editors)
+                      +_safety.py     safety categoriser shim — reads canonical
+                                       from behaviors/scripts/_safety.py with
+                                       vendored fallback for fresh installs
+                      └─editor.py     re-exports categorise / Category / DENYLIST
+                                       from _safety (vision §15 single-source)
     jules/             Jules HTTP + fake client + behavioral dossier
-    gh/                GitHub HTTP + fake client
+    gh/                GitHub HTTP + fake client (incl. Jules outputs → PR translator)
     llm/               BYOK runtime model (OpenAI-compatible) + rule-based fallback
     gateway/           console + telegram + in-memory gateways
   tests/               pytest (asyncio, fakes only — no network, no live creds)
+  deploy/systemd/      Fedora systemd unit (Tier-1 of watchdog hierarchy, vision §16);
+                       install.sh is idempotent install/uninstall
+  scripts/             systemd_smoke.py (CI guard on the unit), live smokes
   vision.md            copy of the canonical product brief
   RUNBOOK.md           plain-language operator manual for the owner
   README.md            human-facing overview on a repo browser
@@ -49,11 +58,15 @@ Julia/
   .gitlab-ci.yml       CI: lint, typecheck, test on python:3.12-slim
 
 behaviors/  (sibling repo, see ../behaviors/README.md)
+  .github/workflows/   GitHub Actions test-prompts.yml — runner for vision §5.4
+                       (low-stakes PRs auto-merge after this workflow is green)
   playbook/            living Jules quirks log (vision §8)
   prompts/             versioned plan-review / clarification / canary prompts
   policies/            autonomy rules, quality gates, safety boundaries
-  tests/               prompt regression suite (vision §5.4)
-  scripts/             self_improve.py + playbook_append.py (PR openers)
+  tests/               prompt regression suite + safety equivalence tests
+                       (cross-imports self_improve against _safety)
+  scripts/             _safety.py (canonical categoriser) + self_improve.py
+                       + playbook_append.py
 ```
 
 The orchestrator and its collaborators are wired together in
