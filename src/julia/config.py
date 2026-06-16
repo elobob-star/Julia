@@ -56,6 +56,10 @@ class Settings(BaseSettings):
     heartbeat_interval_s: int = 300
     poll_interval_s: int = 15
     stall_timeout_s: int = 1800
+    # Step 5: how often the PR watcher polls each behaviour PR for
+    # CI status (vision §5.4). Default 60s keeps GitHub's rate
+    # limits happy while still feeling live during /improve flows.
+    poll_prs_interval_s: int = 60
 
     # Daily rhythm (vision sections 5.6 and 6)
     digest_interval_s: int = 86400

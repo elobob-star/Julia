@@ -1,0 +1,34 @@
+[Unit]
+# Vision §16: Tier-1 relay. The OS supervisor restarts Julia on
+# crash and on boot. This unit is the Fedora host's instance;
+# macOS uses a parallel LaunchAgent (see deploy/launchd/ in a
+# future commit). The unit assumes `pip install -e ".[dev]"` has
+# been run as the host user (see deploy/systemd/README.md).
+Description=Julia orchestrator (AI developer relay on Jules + GitHub)
+Documentation=file:%h/julia/RUNBOOK.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=julia
+Group=julia
+WorkingDirectory=/opt/julia
+# The console entrypoint installed by `pip install -e ".[dev]"`
+# (pyproject.toml [project.scripts] -> julia = julia.cli:main).
+# JULIA_JULES_API_KEY, JULIA_GITHUB_TOKEN, JULIA_DEFAULT_REPO and
+# friends come from /etc/julia/julia.env (EnvironmentFile= below)
+# — never inline.
+ExecStart=/usr/bin/env julia run
+EnvironmentFile=-/etc/julia/julia.env
+Restart=always
+RestartSec=10s
+# Relay-friendly: keep stderr/stdout for `journalctl -u julia`.
+StandardOutput=journal
+StandardError=journal
+# Light resource ceiling — Julia is a polling loop, not a workload.
+MemoryMax=512M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

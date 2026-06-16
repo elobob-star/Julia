@@ -16,6 +16,8 @@ from julia.models import TaskState
 from julia.orchestrator import Orchestrator
 from julia.state import Store
 
+from julia.behavior.editor import FakeBehaviorEditor
+
 
 def make_orchestrator(tmp_path):
     settings = Settings(
@@ -116,3 +118,90 @@ async def test_restart_resumes_in_flight_tasks(tmp_path):
     # ledger still knows everything that happened before the restart.
     fresh_store = Store(tmp_path / 'julia.db')
     assert len(fresh_store.list_tasks(TaskState.MERGED)) == 1
+
+
+async def test_pr_watcher_auto_merges_low_stakes_with_green_ci(tmp_path):
+    """Step 5: behaviour PRs whose CI is green and whose target file
+    lives under prompts/ or playbook/ are auto-merged by the
+    _poll_behavior_prs sweep. Behavioural PRs (policies/) are not."""
+    settings = Settings(
+        _env_file=None,
+        dry_run=True,
+        state_dir=tmp_path,
+        default_repo='acme/app',
+        poll_interval_s=0,
+        poll_prs_interval_s=0,
+    )
+    store = Store(tmp_path / 'julia.db')
+    github = FakeGitHubClient(checks_pass=True)
+    editor = FakeBehaviorEditor()
+    orchestrator = Orchestrator(
+        settings, store, FakeJulesClient(), github, RuleBasedModel(),
+        MemoryGateway(), behavior=editor,
+    )
+    await orchestrator.handle_message(
+        Incoming('/improve prompts/plan_review.md:low-stakes tweak ', 'owner')
+    )
+    await drain(orchestrator)
+    [task] = [t for t in store.list_tasks() if getattr(t, 'kind', 'dev') == 'behavior_pr']
+    task_id = task.id
+    # Fake editor returns a fake-prefix token, not an http URL, so the
+    # watcher skips it. We swap in a real-looking URL so the watcher
+    # has something to poll.
+    task.source_url = f'https://github.com/behaviors/pull/{task_id}'
+    store.save_task(task)
+    await orchestrator._poll_behavior_prs()
+    # Re-fetch from the store because the in-memory task object here
+    # is a stale copy of what the watcher round-tripped via SQLite.
+    merged_list = store.list_tasks(TaskState.MERGED)
+    assert any(t.id == task_id for t in merged_list)
+    assert any(task.source_url in m for m in github.merged)
+    actions = {a for _, _, a, _, _ in store.decisions_for(task_id)}
+    assert 'auto_merged' in actions
+
+
+async def test_pr_watcher_does_not_auto_merge_behavioural(tmp_path):
+    settings = Settings(
+        _env_file=None,
+        dry_run=True,
+        state_dir=tmp_path,
+        default_repo='acme/app',
+        poll_interval_s=0,
+        poll_prs_interval_s=0,
+    )
+    store = Store(tmp_path / 'julia.db')
+    github = FakeGitHubClient(checks_pass=True)
+    editor = FakeBehaviorEditor()
+    orchestrator = Orchestrator(
+        settings, store, FakeJulesClient(), github, RuleBasedModel(),
+        MemoryGateway(), behavior=editor,
+    )
+    await orchestrator.handle_message(
+        Incoming('/improve policies/autonomy_rules.md:behavioural tweak', 'owner')
+    )
+    await drain(orchestrator)
+    [task] = [t for t in store.list_tasks() if getattr(t, 'kind', 'dev') == 'behavior_pr']
+    task_id = task.id
+    task.source_url = f'https://github.com/behaviors/pull/{task_id}'
+    store.save_task(task)
+    await orchestrator._poll_behavior_prs()
+    # Behavioural PR with green CI: still AWAITING_APPROVAL; merge
+    # only happens via /approve-behavior.
+    refreshed_list = store.list_tasks(TaskState.AWAITING_APPROVAL)
+    assert any(t.id == task_id for t in refreshed_list)
+    assert task.source_url not in github.merged
+    # Owner approval flips it.
+    await orchestrator.handle_message(
+        Incoming(f'/approve-behavior {task.source_url}', 'owner')
+    )
+    merged_list = store.list_tasks(TaskState.MERGED)
+    assert any(t.id == task_id for t in merged_list)
+    assert task.source_url in github.merged
+
+
+async def test_approve_behavior_unknown_token_is_courteous(tmp_path):
+    orchestrator, gateway = make_orchestrator(tmp_path)
+    await orchestrator.handle_message(
+        Incoming('/approve-behavior https://github.com/no/such/pr', 'owner')
+    )
+    assert any('No /improve task' in text for text in gateway.sent)

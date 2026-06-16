@@ -44,6 +44,16 @@ class Task:
     error: str | None = None
     created_at: datetime = field(default_factory=utcnow)
     updated_at: datetime = field(default_factory=utcnow)
+    # Step 4: make behaviour PRs discoverable from the ledger so
+    # ``/explain``, the daily digest, and ``/approve-behavior`` can
+    # all reference them. ``kind='dev'`` is the historical default
+    # for ordinary Jules-driven tasks; ``kind='behavior_pr'`` marks
+    # ``/improve``-originated entries. ``source_url`` carries the
+    # editor's return value verbatim — GitHub html_url for the
+    # ``GitHubBehaviorEditor``, a SHA for the ``LocalBehaviorEditor``,
+    # ``fake-...:file`` for the ``FakeBehaviorEditor``.
+    kind: str = 'dev'
+    source_url: str | None = None
 
     def to_json(self) -> str:
         data = asdict(self)
