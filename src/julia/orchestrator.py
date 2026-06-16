@@ -227,7 +227,7 @@ class Orchestrator:
             await asyncio.sleep(max(self.settings.poll_interval_s, 0))
 
     async def _on_plan(self, task: Task, activity: dict[str, Any]) -> None:
-        plan = str(activity.get('plan') or activity.get('description') or '')
+        plan = dossier.extract_plan_text(activity)
         verdict = await self.model.complete(
             dossier.PLAN_REVIEW_SYSTEM_PROMPT,
             f'Task: {task.prompt}\nProposed plan: {plan}',
@@ -275,7 +275,38 @@ class Orchestrator:
         )
 
     async def _on_completed(self, task: Task, activity: dict[str, Any]) -> None:
-        pr_url = str(activity.get('pullRequestUrl') or activity.get('pr_url') or '')
+        pr_url = dossier.extract_pr_url(activity)
+        if not pr_url:
+            # Live wire does not always carry a pullRequestUrl on
+            # sessionCompleted (verified 2026-06-16 -- a single-line
+            # CANARY.md task completed successfully but never reached
+            # the PR stage). We do not auto-apply patches because
+            # vision section 18 lists "history rewrites / destructive
+            # ops / new spend" as never-automated; opening a PR
+            # from a patch on someone else's behalf bridges into
+            # that territory. The right move is to surface the patch
+            # to the owner -- file as QUEUED_NEEDS_REVIEW (a new
+            # state) so they can decide.
+            git_patch = dossier.extract_git_patch(activity)
+            if git_patch:
+                self.store.record_decision(
+                    'orchestrator',
+                    'patch_unapplied',
+                    f'jules completed without opening a PR; patch bytes={len(git_patch)}; awaiting owner decision',
+                    task.id,
+                    meta={'kind': 'completion', 'patch_bytes': len(git_patch)},
+                )
+                task.state = TaskState.AWAITING_APPROVAL
+                task.error = 'jules did not open a PR; owner to apply patch or rerun'
+                task.pr_url = ''  # explicit
+                self.store.save_task(task)
+                await self.gateway.send(
+                    f'Task {task.id} completed but Jules did not open a PR. '
+                    f'Patch captured ({len(git_patch)} bytes). Decision recorded; '
+                    f'apply manually or rerun.'
+                )
+                await self._record('info', task, gist='Jules returned a patch, not a PR. Awaiting owner.')
+                return
         if not pr_url:
             raise RuntimeError('session completed without producing a pull request')
         task.pr_url = pr_url
