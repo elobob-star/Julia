@@ -30,7 +30,7 @@ because a dead machine cannot report its own death.
 ## Quickstart (dry-run, no credentials)
 
 ```bash
-cd julia-main
+cd Julia
 julia run --dry-run
 ```
 
@@ -45,7 +45,7 @@ behaviour changes before going live.
 ## Quickstart (live)
 
 ```bash
-cd julia-main
+cd Julia
 export JULIA_JULES_API_KEY=...
 export JULIA_GITHUB_TOKEN=...
 export JULIA_DEFAULT_REPO=owner/name
@@ -83,7 +83,7 @@ julia run --behaviors /path/to/behaviors
 ```
 
 `/path/to/behaviors` should be a git checkout of the **behaviors**
-repo (sibling of `julia-main/`). Playbook entries write straight
+repo (sibling of `Julia/`). Playbook entries write straight
 to the local file; prompt / policy changes commit locally.
 
 ---

@@ -1,4 +1,4 @@
-# AGENTS.md — `julia-main/`
+# AGENTS.md — `Julia/`
 
 > This is the orientation file for any agent (or human) working in
 > this project. It's deliberately a single file rather than a stack
@@ -26,7 +26,7 @@ follow from that.
 ## Quick orientation
 
 ```
-julia-main/
+Julia/
   src/julia/
     cli.py             argparse entry point; wires Settings → collaborators → Orchestrator
     config.py          pydantic-settings Settings; the JULIA_ env namespace

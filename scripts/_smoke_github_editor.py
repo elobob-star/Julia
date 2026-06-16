@@ -56,7 +56,7 @@ async def main() -> None:
         await editor.record_playbook_entry(
             PlaybookEntry(
                 kind="info",
-                repo=f"{OWNER}/julia-main",
+                repo=f"{OWNER}/Julia",
                 task_id="smoke-test",
                 gist="Real-network smoke: GitHubBehaviorEditor wired live.",
             )
